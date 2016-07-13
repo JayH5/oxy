@@ -34,6 +34,14 @@ func PassHostHeader(b bool) optSetter {
 	}
 }
 
+// StreamResponse forces streaming body (flushes response directly to client)
+func StreamResponse(b bool) optSetter {
+	return func(f *Forwarder) error {
+		f.httpForwarder.streamResponse = b
+		return nil
+	}
+}
+
 // RoundTripper sets a new http.RoundTripper
 // Forwarder will use http.DefaultTransport as a default round tripper
 func RoundTripper(r http.RoundTripper) optSetter {
@@ -93,9 +101,10 @@ type handlerContext struct {
 // httpForwarder is a handler that can reverse proxy
 // HTTP traffic
 type httpForwarder struct {
-	roundTripper http.RoundTripper
-	rewriter     ReqRewriter
-	passHost     bool
+	roundTripper   http.RoundTripper
+	rewriter       ReqRewriter
+	passHost       bool
+	streamResponse bool
 }
 
 // websocketForwarder is a handler that can reverse proxy
@@ -156,6 +165,14 @@ func (f *httpForwarder) serveHTTP(w http.ResponseWriter, req *http.Request, ctx 
 		return
 	}
 
+	utils.CopyHeaders(w.Header(), response.Header)
+	// Remove hop-by-hop headers.
+	utils.RemoveHeaders(w.Header(), HopHeaders...)
+	w.WriteHeader(response.StatusCode)
+
+	stream := "text/event-stream" == response.Header.Get(ContentType) || f.streamResponse
+	written, err := f.copyBody(w, response.Body, stream)
+
 	if req.TLS != nil {
 		ctx.log.Infof("Round trip: %v, code: %v, duration: %v tls:version: %x, tls:resume:%t, tls:csuite:%x, tls:server:%v",
 			req.URL, response.StatusCode, time.Now().UTC().Sub(start),
@@ -168,11 +185,6 @@ func (f *httpForwarder) serveHTTP(w http.ResponseWriter, req *http.Request, ctx 
 			req.URL, response.StatusCode, time.Now().UTC().Sub(start))
 	}
 
-	utils.CopyHeaders(w.Header(), response.Header)
-	// Remove hop-by-hop headers.
-	utils.RemoveHeaders(w.Header(), HopHeaders...)
-	w.WriteHeader(response.StatusCode)
-	written, err := io.Copy(w, response.Body)
 	defer response.Body.Close()
 
 	if err != nil {
@@ -321,4 +333,46 @@ func isWebsocketRequest(req *http.Request) bool {
 		return false
 	}
 	return containsHeader(Connection, "upgrade") && containsHeader(Upgrade, "websocket")
+}
+
+// copyBody the code comes from io.copyBuffer but adds a flush a each iteration if stream enabled
+func (f *httpForwarder) copyBody(dst http.ResponseWriter, src io.Reader, stream bool) (written int64, err error) {
+	// If the reader has a WriteTo method, use it to do the copy.
+	// Avoids an allocation and a copy.
+	if wt, ok := src.(io.WriterTo); ok {
+		return wt.WriteTo(dst)
+	}
+	// Similarly, if the writer has a ReadFrom method, use it to do the copy.
+	if rt, ok := dst.(io.ReaderFrom); ok {
+		return rt.ReadFrom(src)
+	}
+	buf := make([]byte, 32*1024)
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er == io.EOF {
+			break
+		}
+		if er != nil {
+			err = er
+			break
+		}
+		if flusher, ok := dst.(http.Flusher); stream && ok {
+			flusher.Flush()
+		}
+	}
+	return written, err
 }
